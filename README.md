@@ -1,6 +1,6 @@
 # openpsa-to-wmc
 
-Exact probabilities for probabilistic safety assessment (PSA) models, by
+Exact probabilities for probabilistic safety assessment (PSA) models, via
 weighted model counting.
 
 [Open-PSA](https://open-psa.github.io/) is an open initiative of the PSA
