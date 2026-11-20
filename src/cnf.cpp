@@ -19,7 +19,6 @@ struct Enc {
   std::map<std::vector<int>, int> hash;
   std::map<std::string, const Formula*> gate;
   std::map<std::string, int> state;
-  std::vector<std::string> stack;
   std::set<int> owned;
   int nbasics = 0;
 
@@ -121,25 +120,60 @@ struct Enc {
   }
 
   int ref(const Formula& f) {
-    auto v = c.var.find(f.name);
-    if (v != c.var.end() && (state[f.name] == 2 || !gate.count(f.name))) return v->second;
     auto h = m.houses.find(f.name);
     if (h != m.houses.end()) return h->second ? TL : -TL;
-    if (!gate.count(f.name)) throw Error{f.loc, "event " + f.name + " is used but not defined"};
-    return gate_lit(f.name, f.loc);
+    auto v = c.var.find(f.name);
+    if (v == c.var.end()) throw Error{f.loc, "event " + f.name + " is used but not defined"};
+    return v->second;
   }
 
-  int gate_lit(const std::string& nm, Loc loc) {
-    if (state[nm] == 2) return c.var[nm];
-    if (state[nm] == 1) {
-      std::string path;
-      for (auto it = std::find(stack.begin(), stack.end(), nm); it != stack.end(); ++it) path += *it + " -> ";
-      throw Error{loc, "cycle: " + path + nm};
+  void refs(const Formula& f, std::vector<std::string>& gs, std::set<std::string>& bs) {
+    if (f.kind == Formula::Ref) {
+      if (gate.count(f.name)) gs.push_back(f.name);
+      else if (!m.houses.count(f.name)) bs.insert(f.name);
     }
-    state[nm] = 1;
-    stack.push_back(nm);
-    const int l = lit(*gate[nm]);
-    stack.pop_back();
+    for (const auto& k : f.kids) refs(k, gs, bs);
+  }
+
+  // Iterative: synthetic models chain tens of thousands of gates.
+  std::vector<std::string> order(const std::vector<std::string>& roots, std::set<std::string>& used) {
+    std::vector<std::string> out, stack;
+    std::vector<size_t> next;
+    std::map<std::string, std::vector<std::string>> deps;
+    auto push = [&](const std::string& nm) {
+      state[nm] = 1;
+      refs(*gate.at(nm), deps[nm], used);
+      stack.push_back(nm);
+      next.push_back(0);
+    };
+    for (const auto& r : roots) {
+      if (state[r]) continue;
+      push(r);
+      while (!stack.empty()) {
+        const std::string nm = stack.back();
+        const auto& ds = deps[nm];
+        if (next.back() < ds.size()) {
+          const std::string d = ds[next.back()++];
+          if (state[d] == 2) continue;
+          if (state[d] == 1) {
+            std::string path;
+            for (auto it = std::find(stack.begin(), stack.end(), d); it != stack.end(); ++it) path += *it + " -> ";
+            throw Error{gate.at(nm)->loc, "cycle: " + path + d};
+          }
+          push(d);
+        } else {
+          state[nm] = 2;
+          out.push_back(nm);
+          stack.pop_back();
+          next.pop_back();
+        }
+      }
+    }
+    return out;
+  }
+
+  void define(const std::string& nm) {
+    const int l = lit(*gate.at(nm));
     int v;
     if (l > 0 && l != TL && l > nbasics && !owned.count(l)) v = l;
     else {
@@ -153,26 +187,37 @@ struct Enc {
     }
     owned.insert(v);
     c.var[nm] = v;
-    state[nm] = 2;
-    return v;
   }
 
-  void run() {
-    for (const auto& b : m.basics) c.var[b] = fresh();
+  void run(const std::string& top) {
+    std::vector<std::string> roots;
+    std::set<std::string> used;
+    if (top.empty())
+      for (const auto& [nm, f] : m.gates) roots.push_back(nm);
+    else if (gate.count(top)) roots.push_back(top);
+    else used.insert(top);
+    const std::vector<std::string> ord = order(roots, used);
+    for (const auto& b : m.basics)
+      if (top.empty() || used.count(b)) c.var[b] = fresh();
     nbasics = c.nvars;
-    for (const auto& [nm, f] : m.gates) gate_lit(nm, f.loc);
-    std::set<int> show;
-    for (const auto& [nm, v] : c.var) show.insert(v);
-    c.show.assign(show.begin(), show.end());
+    for (const auto& nm : ord) define(nm);
+    // Gates are functions of the basic events, so projecting onto the basic events keeps the
+    // count; counters are much faster that way. Without --top, show everything for assumptions.
+    if (top.empty()) {
+      std::set<int> show;
+      for (const auto& [nm, v] : c.var) show.insert(v);
+      c.show.assign(show.begin(), show.end());
+    } else
+      for (int v = 1; v <= nbasics; v++) c.show.push_back(v);
   }
 };
 
 }  // namespace
 
-Cnf encode(const Model& m) {
+Cnf encode(const Model& m, const std::string& top) {
   Cnf c;
   Enc e(m, c);
-  e.run();
+  e.run(top);
   return c;
 }
 
@@ -180,6 +225,7 @@ void write_cnf(std::ostream& o, const Model& m, const Cnf& c, const std::string&
   o << "c t pwmc\n";
   o << "p cnf " << c.nvars << " " << c.clauses.size() + (top.empty() ? 0 : 1) << "\n";
   for (const auto& b : m.basics) {
+    if (!c.var.count(b)) continue;
     const int v = c.var.at(b);
     const mpq_class& p = m.prob.at(b);
     o << "c p weight " << v << " " << p.get_str() << " 0\n";
@@ -189,7 +235,8 @@ void write_cnf(std::ostream& o, const Model& m, const Cnf& c, const std::string&
   for (const int v : c.show) o << " " << v;
   o << " 0\n";
   for (const auto& [nm, v] : c.var) o << "c " << v << " " << nm << "\n";
-  for (const auto& t : m.tops) o << "c top " << c.var.at(t) << " " << t << "\n";
+  for (const auto& t : m.tops)
+    if (c.var.count(t)) o << "c top " << c.var.at(t) << " " << t << "\n";
   for (const auto& cl : c.clauses) {
     for (const int l : cl) o << l << " ";
     o << "0\n";

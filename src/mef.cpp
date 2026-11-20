@@ -72,13 +72,57 @@ struct XNode {
   Loc loc;
 };
 
+void put_utf8(std::string& o, uint32_t c) {
+  if (c < 0x80) o += (char)c;
+  else if (c < 0x800) {
+    o += (char)(0xC0 | (c >> 6));
+    o += (char)(0x80 | (c & 0x3F));
+  } else if (c < 0x10000) {
+    o += (char)(0xE0 | (c >> 12));
+    o += (char)(0x80 | ((c >> 6) & 0x3F));
+    o += (char)(0x80 | (c & 0x3F));
+  } else {
+    o += (char)(0xF0 | (c >> 18));
+    o += (char)(0x80 | ((c >> 12) & 0x3F));
+    o += (char)(0x80 | ((c >> 6) & 0x3F));
+    o += (char)(0x80 | (c & 0x3F));
+  }
+}
+
+// Some generators write UTF-16 with a BOM; everything else is taken as UTF-8.
+std::string to_utf8(const std::string& raw) {
+  if (raw.size() >= 3 && raw.compare(0, 3, "\xEF\xBB\xBF") == 0) return raw.substr(3);
+  if (raw.size() < 2) return raw;
+  const bool le = (unsigned char)raw[0] == 0xFF && (unsigned char)raw[1] == 0xFE;
+  const bool be = (unsigned char)raw[0] == 0xFE && (unsigned char)raw[1] == 0xFF;
+  if (!le && !be) return raw;
+  std::string o;
+  auto unit = [&](size_t k) -> uint32_t {
+    const unsigned a = (unsigned char)raw[k], b = (unsigned char)raw[k + 1];
+    return le ? a | (b << 8) : (a << 8) | b;
+  };
+  for (size_t k = 2; k + 1 < raw.size(); k += 2) {
+    uint32_t c = unit(k);
+    if (c >= 0xD800 && c < 0xDC00 && k + 3 < raw.size()) {
+      const uint32_t d = unit(k + 2);
+      if (d >= 0xDC00 && d < 0xE000) {
+        c = 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+        k += 2;
+      }
+    }
+    put_utf8(o, c);
+  }
+  return o;
+}
+
 struct XParser {
   const std::string& s;
+  int file;
   size_t i = 0;
   int line = 1;
   size_t ls = 0;
-  explicit XParser(const std::string& src) : s(src) {}
-  Loc loc() const { return Loc{line, (int)(i - ls) + 1}; }
+  XParser(const std::string& src, int f) : s(src), file(f) {}
+  Loc loc() const { return Loc{line, (int)(i - ls) + 1, file}; }
   void adv(size_t n = 1) {
     for (size_t k = 0; k < n && i < s.size(); k++, i++)
       if (s[i] == '\n') {
@@ -108,7 +152,16 @@ struct XParser {
       else if (ent == "gt") o += '>';
       else if (ent == "quot") o += '"';
       else if (ent == "apos") o += '\'';
-      else o += "&" + ent + ";";
+      else if (ent.size() > 1 && ent[0] == '#') {
+        const bool hex = ent[1] == 'x';
+        const std::string d = ent.substr(hex ? 2 : 1);
+        const bool ok = !d.empty() && d.size() <= 6 && std::all_of(d.begin(), d.end(), [&](char c) {
+          return hex ? std::isxdigit((unsigned char)c) : std::isdigit((unsigned char)c);
+        });
+        const unsigned long cp = ok ? std::stoul(d, nullptr, hex ? 16 : 10) : 0;
+        if (ok && cp > 0 && cp <= 0x10FFFF) put_utf8(o, (uint32_t)cp);
+        else o += "&" + ent + ";";
+      } else o += "&" + ent + ";";
       k = e;
     }
     return o;
@@ -210,9 +263,11 @@ int req_int(const XNode& n, const char* a) {
   return std::stoi(v);
 }
 
+bool is_meta(const XNode& n) { return n.tag == "label" || n.tag == "attributes"; }
+
 const XNode* formula_child(const XNode& n) {
   for (const auto& k : n.kids)
-    if (k.tag != "label" && k.tag != "attributes") return &k;
+    if (!is_meta(k)) return &k;
   return nullptr;
 }
 
@@ -222,22 +277,95 @@ std::string label_of(const XNode& n) {
   return "";
 }
 
+enum class Kind { Basic, House, Gate };
+
+const char* kind_name(Kind k) { return k == Kind::Basic ? "basic event" : k == Kind::House ? "house event" : "gate"; }
+
+using Scope = std::vector<std::string>;
+
+std::string join(const Scope& sc, size_t n, const std::string& last) {
+  std::string o;
+  for (size_t k = 0; k < n; k++) o += sc[k] + ".";
+  return o + last;
+}
+
+struct Def {
+  const XNode* n;
+  Scope scope;
+  bool priv;
+  std::string canon;
+};
+
 struct Reader {
   Model m;
+  std::vector<Def> gates, basics, houses;
+  std::vector<const XNode*> trees;
+  // Every event under its full path, and public ones also under their bare name.
+  std::map<std::string, std::string> by_path;
+  std::map<std::string, Kind> kind;
   std::set<std::string> gate_refs;
 
-  void collect(const XNode& n, std::vector<const XNode*>& gates, std::vector<const XNode*>& basics,
-               std::vector<const XNode*>& houses) {
-    if (n.tag == "define-gate") gates.push_back(&n);
-    else if (n.tag == "define-basic-event") basics.push_back(&n);
-    else if (n.tag == "define-house-event") houses.push_back(&n);
-    else if (n.tag == "define-CCF-group" || n.tag == "define-parameter" || n.tag == "define-substitution" ||
-             n.tag == "define-event-tree" || n.tag == "define-initiating-event" || n.tag == "define-extern-function")
-      throw Error{n.loc, "<" + n.tag + "> is not supported yet"};
-    for (const auto& k : n.kids) collect(k, gates, basics, houses);
+  static bool role_private(const XNode& n, bool inherited) {
+    auto it = n.attr.find("role");
+    if (it == n.attr.end()) return inherited;
+    if (it->second != "private" && it->second != "public")
+      throw Error{n.loc, "role must be private or public, not " + it->second};
+    return it->second == "private";
   }
 
-  Formula formula(const XNode& n) {
+  void collect(const XNode& n, const Scope& scope, bool priv) {
+    const std::string& t = n.tag;
+    if (t == "define-gate") gates.push_back({&n, scope, role_private(n, priv), ""});
+    else if (t == "define-basic-event") basics.push_back({&n, scope, role_private(n, priv), ""});
+    else if (t == "define-house-event") houses.push_back({&n, scope, role_private(n, priv), ""});
+    else if (t == "define-event-tree") {
+      if (!scope.empty()) throw Error{n.loc, "<define-event-tree> inside a fault tree"};
+      trees.push_back(&n);
+    } else if (t == "define-initiating-event") {
+    } else if (t == "define-fault-tree" || t == "define-component") {
+      Scope sc = scope;
+      sc.push_back(req(n, "name"));
+      for (const auto& k : n.kids) collect(k, sc, role_private(n, priv));
+    } else if (t == "model-data") {
+      for (const auto& k : n.kids) collect(k, {}, false);
+    } else if (t == "define-CCF-group" || t == "define-parameter" || t == "define-substitution" ||
+               t == "define-extern-function" || t == "define-extern-library" || t == "define-alignment" ||
+               t == "define-rule" || t == "define-consequence" || t == "define-consequence-group") {
+      throw Error{n.loc, "<" + t + "> is not supported yet"};
+    } else {
+      for (const auto& k : n.kids) collect(k, scope, priv);
+    }
+  }
+
+  void add_path(const std::string& path, const std::string& canon, Loc loc) {
+    if (!by_path.emplace(path, canon).second) throw Error{loc, "'" + path + "' is defined twice"};
+  }
+
+  void declare(Def& d, Kind k) {
+    const std::string nm = req(*d.n, "name");
+    const std::string full = join(d.scope, d.scope.size(), nm);
+    d.canon = d.priv ? full : nm;
+    add_path(full, d.canon, d.n->loc);
+    if (!d.priv && full != nm) add_path(nm, d.canon, d.n->loc);
+    kind[d.canon] = k;
+    const std::string l = label_of(*d.n);
+    if (!l.empty()) m.labels[d.canon] = l;
+  }
+
+  // The innermost container's name wins: "G" inside FT.C is tried as FT.C.G, FT.G, then G.
+  std::string resolve(const std::string& name, const Scope& scope, const char* want, Loc loc) {
+    for (size_t k = scope.size() + 1; k-- > 0;) {
+      auto it = by_path.find(join(scope, k, name));
+      if (it == by_path.end()) continue;
+      const Kind got = kind.at(it->second);
+      if (want && got != (std::string(want) == "gate" ? Kind::Gate : std::string(want) == "basic-event" ? Kind::Basic : Kind::House))
+        throw Error{loc, "<" + std::string(want) + " name=\"" + name + "\"> refers to a " + kind_name(got)};
+      return it->second;
+    }
+    throw Error{loc, "event " + name + " is used but not defined"};
+  }
+
+  Formula formula(const XNode& n, const Scope& scope) {
     Formula f;
     f.loc = n.loc;
     const std::string& t = n.tag;
@@ -245,12 +373,12 @@ struct Reader {
       if (n.kids.size() < min || n.kids.size() > max)
         throw Error{n.loc, "<" + t + "> takes " + (min == max ? std::to_string(min) : std::to_string(min) + " or more") +
                                " arguments, not " + std::to_string(n.kids.size())};
-      for (const auto& k : n.kids) f.kids.push_back(formula(k));
+      for (const auto& k : n.kids) f.kids.push_back(formula(k, scope));
     };
     if (t == "gate" || t == "basic-event" || t == "house-event" || t == "event") {
       f.kind = Formula::Ref;
-      f.name = req(n, "name");
-      if (t == "gate") gate_refs.insert(f.name);
+      f.name = resolve(req(n, "name"), scope, t == "event" ? nullptr : t.c_str(), n.loc);
+      if (kind.at(f.name) == Kind::Gate) gate_refs.insert(f.name);
     } else if (t == "constant") {
       f.kind = Formula::Const;
       const std::string v = req(n, "value");
@@ -296,47 +424,120 @@ struct Reader {
     return f;
   }
 
-  void run(const XNode& root) {
-    std::vector<const XNode*> gates, basics, houses;
-    collect(root, gates, basics, houses);
-    std::set<std::string> seen;
-    auto declare = [&](const XNode& n) {
-      const std::string nm = req(n, "name");
-      if (!seen.insert(nm).second) throw Error{n.loc, "'" + nm + "' is defined twice"};
-      const std::string l = label_of(n);
+  struct Tree {
+    std::string name;
+    std::set<std::string> fes;
+    std::map<std::string, const XNode*> branches;
+    std::map<std::string, std::vector<Formula>> reach;
+    std::set<std::string> active;
+  };
+
+  // Each sequence is the OR, over the paths that end in it, of the AND of what those paths collect.
+  void walk(Tree& tr, const XNode& n, std::vector<Formula> conj) {
+    for (const auto& k : n.kids) {
+      if (is_meta(k)) continue;
+      if (k.tag == "collect-formula") {
+        const XNode* f = formula_child(k);
+        if (!f) throw Error{k.loc, "<collect-formula> needs a formula"};
+        conj.push_back(formula(*f, {}));
+      } else if (k.tag == "fork") {
+        const std::string fe = req(k, "functional-event");
+        if (!tr.fes.count(fe)) throw Error{k.loc, "functional event " + fe + " is not defined in event tree " + tr.name};
+        for (const auto& p : k.kids) {
+          if (is_meta(p)) continue;
+          if (p.tag != "path") throw Error{p.loc, "<fork> may only contain <path>, not <" + p.tag + ">"};
+          req(p, "state");
+          walk(tr, p, conj);
+        }
+      } else if (k.tag == "sequence") {
+        const std::string s = req(k, "name");
+        auto it = tr.reach.find(s);
+        if (it == tr.reach.end()) throw Error{k.loc, "sequence " + s + " is not defined in event tree " + tr.name};
+        Formula a;
+        a.kind = Formula::And;
+        a.loc = k.loc;
+        a.kids = conj;
+        it->second.push_back(std::move(a));
+      } else if (k.tag == "branch") {
+        const std::string b = req(k, "name");
+        auto it = tr.branches.find(b);
+        if (it == tr.branches.end()) throw Error{k.loc, "branch " + b + " is not defined in event tree " + tr.name};
+        if (!tr.active.insert(b).second) throw Error{k.loc, "branch " + b + " leads back to itself"};
+        walk(tr, *it->second, conj);
+        tr.active.erase(b);
+      } else {
+        throw Error{k.loc, "<" + k.tag + "> is not supported yet in an event tree"};
+      }
+    }
+  }
+
+  void event_tree(const XNode& et) {
+    Tree tr;
+    tr.name = req(et, "name");
+    const XNode* init = nullptr;
+    std::vector<const XNode*> seqs;
+    for (const auto& k : et.kids) {
+      if (is_meta(k)) continue;
+      if (k.tag == "define-functional-event") tr.fes.insert(req(k, "name"));
+      else if (k.tag == "define-sequence") {
+        if (formula_child(k)) throw Error{formula_child(k)->loc, "instructions in a <define-sequence> are not supported yet"};
+        if (!tr.reach.emplace(req(k, "name"), std::vector<Formula>{}).second)
+          throw Error{k.loc, "sequence " + req(k, "name") + " is defined twice"};
+        seqs.push_back(&k);
+      } else if (k.tag == "define-branch") {
+        if (!tr.branches.emplace(req(k, "name"), &k).second) throw Error{k.loc, "branch " + req(k, "name") + " is defined twice"};
+      } else if (k.tag == "initial-state") init = &k;
+      else throw Error{k.loc, "<" + k.tag + "> is not supported yet in an event tree"};
+    }
+    if (!init) throw Error{et.loc, "event tree " + tr.name + " has no <initial-state>"};
+    walk(tr, *init, {});
+    for (const XNode* s : seqs) {
+      const std::string nm = req(*s, "name");
+      add_path(nm, nm, s->loc);
+      kind[nm] = Kind::Gate;
+      const std::string l = label_of(*s);
       if (!l.empty()) m.labels[nm] = l;
-      return nm;
-    };
-    for (const XNode* b : basics) {
-      const std::string nm = declare(*b);
-      const XNode* f = formula_child(*b);
-      if (!f) throw Error{b->loc, "basic event " + nm + " has no probability"};
+      Formula f;
+      f.kind = Formula::Or;
+      f.loc = s->loc;
+      f.kids = std::move(tr.reach[nm]);
+      m.gates.emplace_back(nm, std::move(f));
+    }
+  }
+
+  void run(const std::vector<XNode>& roots) {
+    for (const auto& r : roots) collect(r, {}, false);
+    for (auto& d : basics) declare(d, Kind::Basic);
+    for (auto& d : houses) declare(d, Kind::House);
+    for (auto& d : gates) declare(d, Kind::Gate);
+    for (const auto& d : basics) {
+      const XNode* f = formula_child(*d.n);
+      if (!f) throw Error{d.n->loc, "basic event " + d.canon + " has no probability"};
       if (f->tag != "float" && f->tag != "int")
-        throw Error{f->loc, "basic event " + nm + ": only a <float> probability is supported yet, not <" + f->tag + ">"};
-      const std::string v = req(*f, "value");
+        throw Error{f->loc, "basic event " + d.canon + ": only a <float> probability is supported yet, not <" + f->tag + ">"};
+      const std::string v = trim(req(*f, "value"));
       mpq_class q;
       if (!parse_prob(v, q) || q < 0 || q > 1) throw Error{f->loc, "bad probability " + v};
-      m.basics.push_back(nm);
-      m.prob[nm] = q;
+      m.basics.push_back(d.canon);
+      m.prob[d.canon] = q;
     }
-    for (const XNode* h : houses) {
-      const std::string nm = declare(*h);
-      const XNode* f = formula_child(*h);
+    for (const auto& d : houses) {
+      const XNode* f = formula_child(*d.n);
       bool v = false;
       if (f) {
-        if (f->tag != "constant") throw Error{f->loc, "house event " + nm + " must have a <constant>"};
+        if (f->tag != "constant") throw Error{f->loc, "house event " + d.canon + " must have a <constant>"};
         const std::string s = req(*f, "value");
         if (s != "true" && s != "false") throw Error{f->loc, "<constant> value must be true or false"};
         v = s == "true";
       }
-      m.houses[nm] = v;
+      m.houses[d.canon] = v;
     }
-    for (const XNode* g : gates) {
-      const std::string nm = declare(*g);
-      const XNode* f = formula_child(*g);
-      if (!f) throw Error{g->loc, "gate " + nm + " has no formula"};
-      m.gates.emplace_back(nm, formula(*f));
+    for (const auto& d : gates) {
+      const XNode* f = formula_child(*d.n);
+      if (!f) throw Error{d.n->loc, "gate " + d.canon + " has no formula"};
+      m.gates.emplace_back(d.canon, formula(*f, d.scope));
     }
+    for (const XNode* t : trees) event_tree(*t);
     for (const auto& [nm, f] : m.gates)
       if (!gate_refs.count(nm)) m.tops.push_back(nm);
   }
@@ -344,11 +545,16 @@ struct Reader {
 
 }  // namespace
 
-Model read_mef(const std::string& xml) {
-  XParser xp(xml);
-  const XNode root = xp.element();
+Model read_mef(const std::vector<std::string>& files) {
+  std::vector<std::string> text;
+  std::vector<XNode> roots;
+  for (const auto& f : files) text.push_back(to_utf8(f));
+  for (size_t k = 0; k < text.size(); k++) {
+    XParser xp(text[k], (int)k);
+    roots.push_back(xp.element());
+  }
   Reader r;
-  r.run(root);
+  r.run(roots);
   return r.m;
 }
 

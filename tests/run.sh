@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
-# Usage: tests/run.sh [SOLVER...]   (default: ../ganak/build/ganak --mode 1)
+# Usage: [GANAK=/path/to/ganak] tests/run.sh [SOLVER...]   (default: $GANAK --mode 1, GANAK defaults to ../ganak/build/ganak)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TOOL="$HERE/../build/openpsa-to-wmc"
-if [ $# -gt 0 ]; then SOLVER=("$@"); else SOLVER=("$HERE/../../ganak/build/ganak" --mode 1); fi
+GANAK="${GANAK:-$HERE/../../ganak/build/ganak}"
+if [ $# -gt 0 ]; then SOLVER=("$@"); else SOLVER=("$GANAK" --mode 1); fi
 CNF="$(mktemp)"
 trap 'rm -f "$CNF"' EXIT
 fail=0
 check() {
-  "$TOOL" --top "$2" -o "$CNF" "$HERE/$1"
+  local top=$1 want=$2
+  shift 2
+  "$TOOL" --top "$top" -o "$CNF" "${@/#/$HERE/}"
   got=$("${SOLVER[@]}" "$CNF" | sed -n 's/^c s exact arb [a-z]* //p')
-  if [ "$got" = "$3" ]; then echo "ok   $1 P($2) = $got"; else echo "FAIL $1 P($2): got '$got', want $3"; fail=1; fi
+  if [ "$got" = "$want" ]; then echo "ok   $1 P($top) = $got"; else echo "FAIL $1 P($top): got '$got', want $want"; fail=1; fi
 }
-check pump.xml TOP 1099/100000
-check pump.xml BothPumps 1/100
+check TOP 1099/100000 pump.xml
+check BothPumps 1/100 pump.xml
+check Damage 109/20000 loss-of-cooling.xml loss-of-cooling-data.xml
+check OK 19891/20000 loss-of-cooling.xml loss-of-cooling-data.xml
+check Cooling.Train.Fail 109/1000 loss-of-cooling.xml loss-of-cooling-data.xml
 exit $fail

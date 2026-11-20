@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<!-- An event tree over private fault-tree gates; basic events in loss-of-cooling-data.xml. -->
+<opsa-mef>
+  <define-initiating-event name="LOC" event-tree="LossOfCooling"/>
+  <define-event-tree name="LossOfCooling">
+    <define-functional-event name="Pumps"/>
+    <define-functional-event name="Backup"/>
+    <define-sequence name="OK"/>
+    <define-sequence name="Damage"/>
+    <initial-state>
+      <fork functional-event="Pumps">
+        <path state="success">
+          <collect-formula><not><gate name="Cooling.PumpsFail"/></not></collect-formula>
+          <sequence name="OK"/>
+        </path>
+        <path state="failure">
+          <collect-formula><gate name="Cooling.PumpsFail"/></collect-formula>
+          <fork functional-event="Backup">
+            <path state="success">
+              <collect-formula><not><basic-event name="Backup"/></not></collect-formula>
+              <sequence name="OK"/>
+            </path>
+            <path state="failure">
+              <collect-formula><basic-event name="Backup"/></collect-formula>
+              <sequence name="Damage"/>
+            </path>
+          </fork>
+        </path>
+      </fork>
+    </initial-state>
+  </define-event-tree>
+  <define-fault-tree name="Cooling">
+    <define-gate name="PumpsFail" role="private">
+      <and><gate name="Train.Fail"/><basic-event name="PumpB"/></and>
+    </define-gate>
+    <define-component name="Train" role="private">
+      <define-gate name="Fail"><or><basic-event name="PumpA"/><basic-event name="Valve"/></or></define-gate>
+    </define-component>
+  </define-fault-tree>
+</opsa-mef>

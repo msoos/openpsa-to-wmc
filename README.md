@@ -25,38 +25,57 @@ make -j$(nproc)
 ## Usage
 
 ```shell
-./openpsa-to-wmc --tops model.xml               # the top gates
+./openpsa-to-wmc --tops model.xml               # the top gates and event-tree sequences
 ./openpsa-to-wmc --top TOP model.xml > top.cnf  # weighted count = P(TOP)
 ganak --mode 1 top.cnf                          # or any other weighted model counter
+./openpsa-to-wmc --top S1 tree.xml data.xml     # several files are read as one model
 ```
 
-Without `--top` the CNF has no unit clause, and the weighted count is 1. Every
-basic event and gate is a variable named in a `c <var> <name>` line, all of
-them in the `c p show` set, so a counter or d-DNNF compiler that takes
+The tests and the fuzzer use [ganak](https://github.com/meelgroup/ganak) as
+the counter. They look for it at `../ganak/build/ganak` (next to this
+repository); elsewhere, set `GANAK`:
+
+```shell
+GANAK=/path/to/ganak tests/run.sh
+GANAK=/path/to/ganak scripts/fuzz.py
+```
+
+With `--top`, only what the top depends on is written, plus its unit clause,
+and `c p show` lists just the basic events: every gate is a function of them,
+so the count is the same, and counters are much faster with the smaller
+projection. Without `--top` there is no unit clause, the weighted count is 1,
+and every basic event and gate is a variable named in a `c <var> <name>` line
+and listed in `c p show`, so a counter or d-DNNF compiler that takes
 assumptions (for example `ganak --compile` and then `bdnnf count --assume`)
 can answer many queries from one compilation.
 
 The encoding: each basic event with probability p is a variable with weights
-p and 1−p; each gate is defined by its formula in both directions (Tseitin),
-so every gate is a function of the basic events and the count needs no
-projection. Probabilities are kept exact (`1e-3` is 1/1000).
+p and 1−p; each gate is defined by its formula in both directions (Tseitin).
+Probabilities are kept exact (`1e-3` is 1/1000).
 
 ## What is supported
 
-Fault trees: `define-gate` with `and`, `or`, `not`, `xor`, `iff`, `imply`,
-`nand`, `nor`, `atleast` and `cardinality`; references to gates, basic events
-and house events; `define-basic-event` with a `float` probability;
-`define-house-event` with a `constant`. Anything else (parameters and
-expressions, common-cause groups, event trees, substitutions) is reported as
-not supported yet.
+- Fault trees: `define-gate` with `and`, `or`, `not`, `xor`, `iff`, `imply`,
+  `nand`, `nor`, `atleast` and `cardinality`; `define-basic-event` with a
+  `float` probability; `define-house-event` with a `constant`.
+- Names: `define-fault-tree` and `define-component` scopes with
+  `role="private|public"`; references by bare name or path (`FT.Comp.G`).
+  Private events are called by their full path, e.g. in `--top`.
+- Event trees: `define-event-tree` with functional events, sequences,
+  branches, `fork`/`path` and `collect-formula`. Each sequence is a gate, the
+  OR over the paths that reach it of what they collect.
+- Several input files, UTF-8 or UTF-16 with a BOM.
+
+Parameters and expressions, common-cause groups, substitutions and the other
+event-tree instructions are reported as not supported yet; see `TODO.md`.
 
 ## Testing
 
 ```shell
 tests/run.sh                       # small models with known answers
-scripts/fuzz.py --num 500          # random fault trees against brute force
+scripts/fuzz.py --num 500          # random models against brute force
 ```
 
-Both use `../ganak/build/ganak --mode 1` by default; pass another counter as
-`tests/run.sh <command>` or `scripts/fuzz.py --solver "<command>"`. The counter
-must print its exact result as `c s exact arb frac N` (or `int N`).
+To use a counter other than ganak, pass it as `tests/run.sh <command>` or
+`scripts/fuzz.py --solver "<command>"`. It must print its exact result as
+`c s exact arb frac N` (or `int N`).

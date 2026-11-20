@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<opsa-mef>
+  <model-data>
+    <define-basic-event name="PumpA"><float value="0.1"/></define-basic-event>
+    <define-basic-event name="PumpB"><float value=" 0.1 "/></define-basic-event>
+    <define-basic-event name="Valve"><float value="1e-2"/></define-basic-event>
+    <define-basic-event name="Backup"><float value="0.5"/></define-basic-event>
+  </model-data>
+</opsa-mef>
