@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<!-- Two redundant pumps and a shared valve. -->
+<opsa-mef>
+  <define-fault-tree name="Pumps">
+    <define-gate name="TOP">
+      <label>No flow</label>
+      <or>
+        <gate name="BothPumps"/>
+        <basic-event name="Valve-1"/>
+      </or>
+    </define-gate>
+    <define-gate name="BothPumps">
+      <and><basic-event name="PumpA"/><basic-event name="PumpB"/></and>
+    </define-gate>
+  </define-fault-tree>
+  <model-data>
+    <define-basic-event name="PumpA"><float value="0.1"/></define-basic-event>
+    <define-basic-event name="PumpB"><float value="0.1"/></define-basic-event>
+    <define-basic-event name="Valve-1"><float value="1e-3"/></define-basic-event>
+  </model-data>
+</opsa-mef>
