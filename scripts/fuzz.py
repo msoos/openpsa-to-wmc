@@ -18,7 +18,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "build", "openpsa-to-wmc")
 OUT = os.path.join(ROOT, "fuzz-out")
 GANAK = os.environ.get("GANAK", os.path.join(ROOT, "..", "ganak", "build", "ganak"))
-SOLVER = shlex.quote(GANAK) + " --mode 1"
+SOLVER = shlex.quote(GANAK) + " --mode 1 --coverdrop 0"
 
 
 class Fail(Exception):

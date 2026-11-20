@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Usage: [GANAK=/path/to/ganak] tests/run.sh [SOLVER...]   (default: $GANAK --mode 1, GANAK defaults to ../ganak/build/ganak)
+# Usage: [GANAK=/path/to/ganak] tests/run.sh [SOLVER...]   (default: $GANAK --mode 1 --coverdrop 0, GANAK defaults to ../ganak/build/ganak)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TOOL="$HERE/../build/openpsa-to-wmc"
 GANAK="${GANAK:-$HERE/../../ganak/build/ganak}"
-if [ $# -gt 0 ]; then SOLVER=("$@"); else SOLVER=("$GANAK" --mode 1); fi
+if [ $# -gt 0 ]; then SOLVER=("$@"); else SOLVER=("$GANAK" --mode 1 --coverdrop 0); fi
 CNF="$(mktemp)"
 trap 'rm -f "$CNF"' EXIT
 fail=0
